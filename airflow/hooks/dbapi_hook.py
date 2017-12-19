@@ -15,9 +15,10 @@
 from builtins import str
 from past.builtins import basestring
 from datetime import datetime
-import numpy
-import logging
+from contextlib import closing
 import sys
+
+from sqlalchemy import create_engine
 
 from airflow.hooks.base_hook import BaseHook
 from airflow.exceptions import AirflowException
@@ -56,6 +57,22 @@ class DbApiHook(BaseHook):
             username=db.login,
             schema=db.schema)
 
+    def get_uri(self):
+        conn = self.get_connection(getattr(self, self.conn_name_attr))
+        login = ''
+        if conn.login:
+            login = '{conn.login}:{conn.password}@'.format(conn=conn)
+        host = conn.host
+        if conn.port is not None:
+            host += ':{port}'.format(port=conn.port)
+        return '{conn.conn_type}://{login}{host}/{conn.schema}'.format(
+            conn=conn, login=login, host=host)
+
+    def get_sqlalchemy_engine(self, engine_kwargs=None):
+        if engine_kwargs is None:
+            engine_kwargs = {}
+        return create_engine(self.get_uri(), **engine_kwargs)
+
     def get_pandas_df(self, sql, parameters=None):
         """
         Executes the sql and returns a pandas dataframe
@@ -69,10 +86,9 @@ class DbApiHook(BaseHook):
         if sys.version_info[0] < 3:
             sql = sql.encode('utf-8')
         import pandas.io.sql as psql
-        conn = self.get_conn()
-        df = psql.read_sql(sql, con=conn, params=parameters)
-        conn.close()
-        return df
+
+        with closing(self.get_conn()) as conn:
+            return psql.read_sql(sql, con=conn, params=parameters)
 
     def get_records(self, sql, parameters=None):
         """
@@ -86,16 +102,14 @@ class DbApiHook(BaseHook):
         """
         if sys.version_info[0] < 3:
             sql = sql.encode('utf-8')
-        conn = self.get_conn()
-        cur = self.get_cursor()
-        if parameters is not None:
-            cur.execute(sql, parameters)
-        else:
-            cur.execute(sql)
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return rows
+
+        with closing(self.get_conn()) as conn:
+            with closing(conn.cursor()) as cur:
+                if parameters is not None:
+                    cur.execute(sql, parameters)
+                else:
+                    cur.execute(sql)
+                return cur.fetchall()
 
     def get_first(self, sql, parameters=None):
         """
@@ -109,16 +123,14 @@ class DbApiHook(BaseHook):
         """
         if sys.version_info[0] < 3:
             sql = sql.encode('utf-8')
-        conn = self.get_conn()
-        cur = conn.cursor()
-        if parameters is not None:
-            cur.execute(sql, parameters)
-        else:
-            cur.execute(sql)
-        rows = cur.fetchone()
-        cur.close()
-        conn.close()
-        return rows
+
+        with closing(self.get_conn()) as conn:
+            with closing(conn.cursor()) as cur:
+                if parameters is not None:
+                    cur.execute(sql, parameters)
+                else:
+                    cur.execute(sql)
+                return cur.fetchone()
 
     def run(self, sql, autocommit=False, parameters=None):
         """
@@ -135,25 +147,24 @@ class DbApiHook(BaseHook):
         :param parameters: The parameters to render the SQL query with.
         :type parameters: mapping or iterable
         """
-        conn = self.get_conn()
         if isinstance(sql, basestring):
             sql = [sql]
 
-        if self.supports_autocommit:
-            self.set_autocommit(conn, autocommit)
+        with closing(self.get_conn()) as conn:
+            if self.supports_autocommit:
+                self.set_autocommit(conn, autocommit)
 
-        cur = conn.cursor()
-        for s in sql:
-            if sys.version_info[0] < 3:
-                s = s.encode('utf-8')
-            logging.info(s)
-            if parameters is not None:
-                cur.execute(s, parameters)
-            else:
-                cur.execute(s)
-        cur.close()
-        conn.commit()
-        conn.close()
+            with closing(conn.cursor()) as cur:
+                for s in sql:
+                    if sys.version_info[0] < 3:
+                        s = s.encode('utf-8')
+                    self.log.info(s)
+                    if parameters is not None:
+                        cur.execute(s, parameters)
+                    else:
+                        cur.execute(s)
+
+            conn.commit()
 
     def set_autocommit(self, conn, autocommit):
         conn.autocommit = autocommit
@@ -167,7 +178,7 @@ class DbApiHook(BaseHook):
     def insert_rows(self, table, rows, target_fields=None, commit_every=1000):
         """
         A generic way to insert a set of tuples into a table,
-        the whole set of inserts is treated as one transaction
+        a new transaction is created every commit_every rows
 
         :param table: Name of the target table
         :type table: str
@@ -184,45 +195,53 @@ class DbApiHook(BaseHook):
             target_fields = "({})".format(target_fields)
         else:
             target_fields = ''
-        conn = self.get_conn()
-        cur = conn.cursor()
-        if self.supports_autocommit:
-            cur.execute('SET autocommit = 0')
-        conn.commit()
-        i = 0
-        for row in rows:
-            i += 1
-            l = []
-            for cell in row:
-                l.append(self._serialize_cell(cell))
-            values = tuple(l)
-            sql = "INSERT INTO {0} {1} VALUES ({2});".format(
-                table,
-                target_fields,
-                ",".join(values))
-            cur.execute(sql)
-            if commit_every and i % commit_every == 0:
-                conn.commit()
-                logging.info(
-                    "Loaded {i} into {table} rows so far".format(**locals()))
-        conn.commit()
-        cur.close()
-        conn.close()
-        logging.info(
+
+        with closing(self.get_conn()) as conn:
+            if self.supports_autocommit:
+                self.set_autocommit(conn, False)
+
+            conn.commit()
+
+            with closing(conn.cursor()) as cur:
+                for i, row in enumerate(rows, 1):
+                    l = []
+                    for cell in row:
+                        l.append(self._serialize_cell(cell, conn))
+                    values = tuple(l)
+                    placeholders = ["%s",]*len(values)
+                    sql = "INSERT INTO {0} {1} VALUES ({2});".format(
+                        table,
+                        target_fields,
+                        ",".join(placeholders))
+                    cur.execute(sql, values)
+                    if commit_every and i % commit_every == 0:
+                        conn.commit()
+                        self.log.info(
+                            "Loaded {i} into {table} rows so far".format(**locals())
+                        )
+
+            conn.commit()
+        self.log.info(
             "Done loading. Loaded a total of {i} rows".format(**locals()))
 
     @staticmethod
-    def _serialize_cell(cell):
-        if isinstance(cell, basestring):
-            return "'" + str(cell).replace("'", "''") + "'"
-        elif cell is None:
-            return 'NULL'
-        elif isinstance(cell, numpy.datetime64):
-            return "'" + str(cell) + "'"
-        elif isinstance(cell, datetime):
-            return "'" + cell.isoformat() + "'"
-        else:
-            return str(cell)
+    def _serialize_cell(cell, conn=None):
+        """
+        Returns the SQL literal of the cell as a string.
+
+        :param cell: The cell to insert into the table
+        :type cell: object
+        :param conn: The database connection
+        :type conn: connection object
+        :return: The serialized cell
+        :rtype: str
+        """
+
+        if cell is None:
+            return None
+        if isinstance(cell, datetime):
+            return cell.isoformat()
+        return str(cell)
 
     def bulk_dump(self, table, tmp_file):
         """

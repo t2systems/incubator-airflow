@@ -36,7 +36,7 @@ class EmailOperator(BaseOperator):
     :type bcc: list or string (comma or semicolon delimited)
     """
 
-    template_fields = ('subject', 'html_content')
+    template_fields = ('to', 'subject', 'html_content')
     template_ext = ('.html',)
     ui_color = '#e6faf9'
 
@@ -49,6 +49,7 @@ class EmailOperator(BaseOperator):
             files=None,
             cc=None,
             bcc=None,
+            mime_subtype='mixed',
             *args, **kwargs):
         super(EmailOperator, self).__init__(*args, **kwargs)
         self.to = to
@@ -57,6 +58,7 @@ class EmailOperator(BaseOperator):
         self.files = files or []
         self.cc = cc
         self.bcc = bcc
+        self.mime_subtype = mime_subtype
 
     def execute(self, context):
-        send_email(self.to, self.subject, self.html_content, files=self.files, cc=self.cc, bcc=self.bcc)
+        send_email(self.to, self.subject, self.html_content, files=self.files, cc=self.cc, bcc=self.bcc, mime_subtype=self.mime_subtype)

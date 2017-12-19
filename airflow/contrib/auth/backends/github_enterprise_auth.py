@@ -11,8 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import logging
-
 import flask_login
 
 # Need to expose these downstream
@@ -29,8 +27,10 @@ from flask_oauthlib.client import OAuth
 
 from airflow import models, configuration, settings
 from airflow.configuration import AirflowConfigException
+from airflow.utils.db import provide_session
+from airflow.utils.log.logging_mixin import LoggingMixin
 
-_log = logging.getLogger(__name__)
+log = LoggingMixin().log
 
 
 def get_config_param(param):
@@ -138,13 +138,21 @@ class GHEAuthBackend(object):
 
     def ghe_team_check(self, username, ghe_token):
         try:
-            teams = [team.strip()
-                     for team in
-                     get_config_param('allowed_teams').split(',')]
+            # the response from ghe returns the id of the team as an integer
+            try:
+                allowed_teams = [int(team.strip())
+                                 for team in
+                                 get_config_param('allowed_teams').split(',')]
+            except ValueError:
+                # this is to deprecate using the string name for a team
+                raise ValueError('it appears that you are using the string name for a team, '
+                                 'please use the id number instead')
+
         except AirflowConfigException:
             # No allowed teams defined, let anyone in GHE in.
             return True
 
+        # https://developer.github.com/v3/orgs/teams/#list-user-teams
         resp = self.ghe_oauth.get(self.ghe_api_route('/user/teams'),
                                   token=(ghe_token, ''))
 
@@ -154,30 +162,30 @@ class GHEAuthBackend(object):
                     resp.status if resp else 'None'))
 
         for team in resp.data:
-            # team json object has a slug cased team name field aptly named
-            # 'slug'
-            if team['slug'] in teams:
+            # mylons: previously this line used to be if team['slug'] in teams
+            # however, teams are part of organizations. organizations are unique,
+            # but teams are not therefore 'slug' for a team is not necessarily unique.
+            # use id instead
+            if team['id'] in allowed_teams:
                 return True
 
         _log.debug('Denying access for user "%s", not a member of "%s"',
                    username,
-                   str(teams))
+                   str(allowed_teams))
 
         return False
 
-    def load_user(self, userid):
+    @provide_session
+    def load_user(self, userid, session=None):
         if not userid or userid == 'None':
             return None
 
-        session = settings.Session()
         user = session.query(models.User).filter(
             models.User.id == int(userid)).first()
-        session.expunge_all()
-        session.commit()
-        session.close()
         return GHEUser(user)
 
-    def oauth_callback(self):
+    @provide_session
+    def oauth_callback(self, session=None):
         _log.debug('GHE OAuth callback called')
 
         next_url = request.args.get('next') or url_for('admin.index')
@@ -201,8 +209,6 @@ class GHEAuthBackend(object):
             _log.exception('')
             return redirect(url_for('airflow.noaccess'))
 
-        session = settings.Session()
-
         user = session.query(models.User).filter(
             models.User.username == username).first()
 
@@ -216,7 +222,6 @@ class GHEAuthBackend(object):
         session.commit()
         login_user(GHEUser(user))
         session.commit()
-        session.close()
 
         return redirect(next_url)
 

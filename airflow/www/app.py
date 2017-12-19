@@ -13,42 +13,48 @@
 # limitations under the License.
 #
 import socket
+import six
 
 from flask import Flask
 from flask_admin import Admin, base
 from flask_cache import Cache
-from flask_wtf.csrf import CsrfProtect
+from flask_wtf.csrf import CSRFProtect
+csrf = CSRFProtect()
 
 import airflow
-from airflow import models
+from airflow import configuration as conf
+from airflow import models, LoggingMixin
 from airflow.settings import Session
 
 from airflow.www.blueprints import routes
+from airflow.logging_config import configure_logging
 from airflow import jobs
 from airflow import settings
 from airflow import configuration
 
-csrf = CsrfProtect()
 
-
-def create_app(config=None):
+def create_app(config=None, testing=False):
     app = Flask(__name__)
     app.secret_key = configuration.get('webserver', 'SECRET_KEY')
     app.config['LOGIN_DISABLED'] = not configuration.getboolean('webserver', 'AUTHENTICATE')
 
     csrf.init_app(app)
 
-    #app.config = config
+    app.config['TESTING'] = testing
+
     airflow.load_login()
     airflow.login.login_manager.init_app(app)
+
+    from airflow import api
+    api.load_auth()
+    api.api_auth.init_app(app)
 
     cache = Cache(
         app=app, config={'CACHE_TYPE': 'filesystem', 'CACHE_DIR': '/tmp'})
 
     app.register_blueprint(routes)
 
-    log_format = airflow.settings.LOG_FORMAT_WITH_PID
-    airflow.settings.configure_logging(log_format=log_format)
+    configure_logging()
 
     with app.app_context():
         from airflow.www import views
@@ -64,9 +70,11 @@ def create_app(config=None):
         av(vs.Airflow(name='DAGs', category='DAGs'))
 
         av(vs.QueryView(name='Ad Hoc Query', category="Data Profiling"))
-        av(vs.ChartModelView(
-            models.Chart, Session, name="Charts", category="Data Profiling"))
-        av(vs.KnowEventView(
+
+        if not conf.getboolean('core', 'secure_mode'):
+            av(vs.ChartModelView(
+                models.Chart, Session, name="Charts", category="Data Profiling"))
+        av(vs.KnownEventView(
             models.KnownEvent,
             Session, name="Known Events", category="Data Profiling"))
         av(vs.SlaMissModelView(
@@ -88,13 +96,15 @@ def create_app(config=None):
             models.Connection, Session, name="Connections", category="Admin"))
         av(vs.VariableView(
             models.Variable, Session, name="Variables", category="Admin"))
+        av(vs.XComView(
+            models.XCom, Session, name="XComs", category="Admin"))
 
         admin.add_link(base.MenuLink(
             category='Docs', name='Documentation',
             url='http://pythonhosted.org/airflow/'))
         admin.add_link(
             base.MenuLink(category='Docs',
-                name='Github',url='https://github.com/airbnb/airflow'))
+                name='Github',url='https://github.com/apache/incubator-airflow'))
 
         av(vs.VersionView(name='Version', category="About"))
 
@@ -106,16 +116,32 @@ def create_app(config=None):
 
         def integrate_plugins():
             """Integrate plugins to the context"""
+            log = LoggingMixin().log
             from airflow.plugins_manager import (
                 admin_views, flask_blueprints, menu_links)
             for v in admin_views:
+                log.debug('Adding view %s', v.name)
                 admin.add_view(v)
             for bp in flask_blueprints:
+                log.debug('Adding blueprint %s', bp.name)
                 app.register_blueprint(bp)
             for ml in sorted(menu_links, key=lambda x: x.name):
+                log.debug('Adding menu link %s', ml.name)
                 admin.add_link(ml)
 
         integrate_plugins()
+
+        import airflow.www.api.experimental.endpoints as e
+        # required for testing purposes otherwise the module retains
+        # a link to the default_auth
+        if app.config['TESTING']:
+            if six.PY2:
+                reload(e)
+            else:
+                import importlib
+                importlib.reload(e)
+
+        app.register_blueprint(e.api_experimental, url_prefix='/api/experimental')
 
         @app.context_processor
         def jinja_globals():

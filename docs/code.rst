@@ -72,6 +72,7 @@ Operator API
         PrestoIntervalCheckOperator,
         PrestoValueCheckOperator,
         PythonOperator,
+        PythonVirtualenvOperator,
         S3KeySensor,
         S3ToHiveTransfer,
         ShortCircuitOperator,
@@ -91,13 +92,20 @@ Community-contributed Operators
 .. automodule:: airflow.contrib.operators
     :show-inheritance:
     :members:
-        SSHExecuteOperator,
+        SSHOperator,
         VerticaOperator,
         VerticaToHiveTransfer
 
 .. autoclass:: airflow.contrib.operators.bigquery_operator.BigQueryOperator
 .. autoclass:: airflow.contrib.operators.bigquery_to_gcs.BigQueryToCloudStorageOperator
+.. autoclass:: airflow.contrib.operators.databricks_operator.DatabricksSubmitRunOperator
+.. autoclass:: airflow.contrib.operators.ecs_operator.ECSOperator
+.. autoclass:: airflow.contrib.operators.file_to_wasb.FileToWasbOperator
 .. autoclass:: airflow.contrib.operators.gcs_download_operator.GoogleCloudStorageDownloadOperator
+.. autoclass:: airflow.contrib.operators.pubsub_operator.PubSubTopicCreateOperator
+.. autoclass:: airflow.contrib.operators.pubsub_operator.PubSubTopicDeleteOperator
+.. autoclass:: airflow.contrib.operators.pubsub_operator.PubSubSubscriptionCreateOperator
+.. autoclass:: airflow.contrib.operators.pubsub_operator.PubSubPublishOperator
 .. autoclass:: airflow.contrib.operators.QuboleOperator
 .. autoclass:: airflow.contrib.operators.hipchat_operator.HipChatAPIOperator
 .. autoclass:: airflow.contrib.operators.hipchat_operator.HipChatAPISendRoomNotificationOperator
@@ -126,6 +134,8 @@ Variable                            Description
 ``{{ ts }}``                        same as ``execution_date.isoformat()``
 ``{{ ts_nodash }}``                 same as ``ts`` without ``-`` and ``:``
 ``{{ execution_date }}``            the execution_date, (datetime.datetime)
+``{{ prev_execution_date }}``       the previous execution date (if available) (datetime.datetime)
+``{{ next_execution_date }}``       the next execution date (datetime.datetime)
 ``{{ dag }}``                       the DAG object
 ``{{ task }}``                      the Task object
 ``{{ macros }}``                    a reference to the macros package, described below
@@ -140,13 +150,13 @@ Variable                            Description
                                     key within the JSON object
 ``{{ task_instance_key_str }}``     a unique, human-readable key to the task instance
                                     formatted ``{dag_id}_{task_id}_{ds}``
-``conf``                            the full configuration object located at
+``{{ conf }}``                      the full configuration object located at
                                     ``airflow.configuration.conf`` which
                                     represents the content of your
                                     ``airflow.cfg``
-``run_id``                          the ``run_id`` of the current DAG run
-``dag_run``                         a reference to the DagRun object
-``test_mode``                       whether the task instance was called using
+``{{ run_id }}``                    the ``run_id`` of the current DAG run
+``{{ dag_run }}``                   a reference to the DagRun object
+``{{ test_mode }}``                 whether the task instance was called using
                                     the CLI's test subcommand
 =================================   ====================================
 
@@ -210,6 +220,7 @@ Hooks
     :show-inheritance:
     :members:
         DbApiHook,
+        DockerHook,
         HiveCliHook,
         HiveMetastoreHook,
         HiveServer2Hook,
@@ -234,7 +245,8 @@ Community contributed hooks
         VerticaHook,
         FTPHook,
         SSHHook,
-        CloudantHook
+        CloudantHook,
+        PubSubHook
 
 .. autoclass:: airflow.contrib.hooks.gcs_hook.GoogleCloudStorageHook
 

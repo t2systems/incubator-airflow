@@ -21,34 +21,35 @@ in their PYTHONPATH. airflow_login should be based off the
 """
 from builtins import object
 from airflow import version
+from airflow.utils.log.logging_mixin import LoggingMixin
+
 __version__ = version.version
 
-import logging
-import os
 import sys
 
 from airflow import configuration as conf
-
+from airflow import settings
 from airflow.models import DAG
 from flask_admin import BaseView
 from importlib import import_module
 from airflow.exceptions import AirflowException
 
-DAGS_FOLDER = os.path.expanduser(conf.get('core', 'DAGS_FOLDER'))
-if DAGS_FOLDER not in sys.path:
-    sys.path.append(DAGS_FOLDER)
+if settings.DAGS_FOLDER not in sys.path:
+    sys.path.append(settings.DAGS_FOLDER)
 
 login = None
 
 
 def load_login():
+    log = LoggingMixin().log
+
     auth_backend = 'airflow.default_login'
     try:
         if conf.getboolean('webserver', 'AUTHENTICATE'):
             auth_backend = conf.get('webserver', 'auth_backend')
     except conf.AirflowConfigException:
         if conf.getboolean('webserver', 'AUTHENTICATE'):
-            logging.warning(
+            log.warning(
                 "auth_backend not found in webserver config reverting to "
                 "*deprecated*  behavior of importing airflow_login")
             auth_backend = "airflow_login"
@@ -57,7 +58,7 @@ def load_login():
         global login
         login = import_module(auth_backend)
     except ImportError as err:
-        logging.critical(
+        log.critical(
             "Cannot import authentication module %s. "
             "Please correct your authentication backend or disable authentication: %s",
             auth_backend, err
@@ -78,8 +79,8 @@ from airflow import operators
 from airflow import hooks
 from airflow import executors
 from airflow import macros
-from airflow import contrib
 
 operators._integrate_plugins()
 hooks._integrate_plugins()
+executors._integrate_plugins()
 macros._integrate_plugins()

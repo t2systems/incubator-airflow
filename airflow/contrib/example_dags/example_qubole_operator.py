@@ -12,29 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+This is only an example DAG to highlight usage of QuboleOperator in various scenarios,
+some of these tasks may or may not work based on your Qubole account setup.
+
+Run a shell command from Qubole Analyze against your Airflow cluster with following to
+trigger it manually `airflow trigger_dag example_qubole_operator`.
+
+*Note: Make sure that connection `qubole_default` is properly set before running this
+example. Also be aware that it might spin up clusters to run these examples.*
+"""
+
+import airflow
 from airflow import DAG
 from airflow.operators.dummy_operator import DummyOperator
 from airflow.operators.python_operator import PythonOperator, BranchPythonOperator
 from airflow.contrib.operators.qubole_operator import QuboleOperator
-from datetime import datetime, timedelta
 import filecmp
 import random
-
-seven_days_ago = datetime.combine(datetime.today() - timedelta(7),
-                                  datetime.min.time())
 
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    'start_date': seven_days_ago,
-    'email': ['airflow@airflow.com'],
+    'start_date': airflow.utils.dates.days_ago(2),
+    'email': ['airflow@example.com'],
     'email_on_failure': False,
     'email_on_retry': False
 }
 
-# NOTE:: This is only an example DAG to highlight usage of QuboleOperator in various scenarios,
-# some of the tasks may or may not work based on your QDS account setup
-dag = DAG('example_qubole_operator', default_args=default_args, schedule_interval='@daily')
+dag = DAG('example_qubole_operator', default_args=default_args, schedule_interval=None)
+
+dag.doc_md = __doc__
 
 def compare_result(ds, **kwargs):
     ti = kwargs['ti']
@@ -58,6 +66,8 @@ t2 = QuboleOperator(
     script_location="s3n://public-qubole/qbol-library/scripts/show_table.hql",
     notfiy=True,
     tags=['tag1', 'tag2'],
+    # If the script at s3 location has any qubole specific macros to be replaced
+    # macros='[{"date": "{{ ds }}"}, {"name" : "abc"}]',
     trigger_rule="all_done",
     dag=dag)
 

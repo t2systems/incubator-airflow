@@ -17,20 +17,32 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-from datetime import datetime
 from functools import wraps
-import logging
+
 import os
-
-from alembic.config import Config
-from alembic import command
-from alembic.migration import MigrationContext
-
-from sqlalchemy import event, exc
-from sqlalchemy.pool import Pool
+import contextlib
 
 from airflow import settings
-from airflow import configuration
+from airflow.utils.log.logging_mixin import LoggingMixin
+
+log = LoggingMixin().log
+
+
+@contextlib.contextmanager
+def create_session():
+    """
+    Contextmanager that will create and teardown a session.
+    """
+    session = settings.Session()
+    try:
+        yield session
+        session.expunge_all()
+        session.commit()
+    except:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 def provide_session(func):
@@ -42,37 +54,21 @@ def provide_session(func):
     """
     @wraps(func)
     def wrapper(*args, **kwargs):
-        needs_session = False
         arg_session = 'session'
+
         func_params = func.__code__.co_varnames
         session_in_args = arg_session in func_params and \
             func_params.index(arg_session) < len(args)
-        if not (arg_session in kwargs or session_in_args):
-            needs_session = True
-            session = settings.Session()
-            kwargs[arg_session] = session
-        result = func(*args, **kwargs)
-        if needs_session:
-            session.expunge_all()
-            session.commit()
-            session.close()
-        return result
+        session_in_kwargs = arg_session in kwargs
+
+        if session_in_kwargs or session_in_args:
+            return func(*args, **kwargs)
+        else:
+            with create_session() as session:
+                kwargs[arg_session] = session
+                return func(*args, **kwargs)
+
     return wrapper
-
-
-def pessimistic_connection_handling():
-    @event.listens_for(Pool, "checkout")
-    def ping_connection(dbapi_connection, connection_record, connection_proxy):
-        '''
-        Disconnect Handling - Pessimistic, taken from:
-        http://docs.sqlalchemy.org/en/rel_0_9/core/pooling.html
-        '''
-        cursor = dbapi_connection.cursor()
-        try:
-            cursor.execute("SELECT 1")
-        except:
-            raise exc.DisconnectionError()
-        cursor.close()
 
 
 @provide_session
@@ -82,22 +78,6 @@ def merge_conn(conn, session=None):
     if not session.query(C).filter(C.conn_id == conn.conn_id).first():
         session.add(conn)
         session.commit()
-
-
-@event.listens_for(settings.engine, "connect")
-def connect(dbapi_connection, connection_record):
-    connection_record.info['pid'] = os.getpid()
-
-
-@event.listens_for(settings.engine, "checkout")
-def checkout(dbapi_connection, connection_record, connection_proxy):
-    pid = os.getpid()
-    if connection_record.info['pid'] != pid:
-        connection_record.connection = connection_proxy.connection = None
-        raise exc.DisconnectionError(
-            "Connection record belongs to pid {}, "
-            "attempting to check out in pid {}".format(connection_record.info['pid'], pid)
-        )
 
 
 def initdb():
@@ -114,7 +94,7 @@ def initdb():
     merge_conn(
         models.Connection(
             conn_id='airflow_ci', conn_type='mysql',
-            host='localhost', login='root',
+            host='localhost', login='root', extra="{\"local_infile\": true}",
             schema='airflow_ci'))
     merge_conn(
         models.Connection(
@@ -134,6 +114,10 @@ def initdb():
             conn_id='presto_default', conn_type='presto',
             host='localhost',
             schema='hive', port=3400))
+    merge_conn(
+        models.Connection(
+            conn_id='google_cloud_default', conn_type='google_cloud_platform',
+            schema='default',))
     merge_conn(
         models.Connection(
             conn_id='hive_cli_default', conn_type='hive_cli',
@@ -177,6 +161,10 @@ def initdb():
             host='localhost', port=5433))
     merge_conn(
         models.Connection(
+            conn_id='wasb_default', conn_type='wasb',
+            extra='{"sas_token": null}'))
+    merge_conn(
+        models.Connection(
             conn_id='webhdfs_default', conn_type='hdfs',
             host='localhost', port=50070))
     merge_conn(
@@ -191,6 +179,23 @@ def initdb():
         models.Connection(
             conn_id='aws_default', conn_type='aws',
             extra='{"region_name": "us-east-1"}'))
+    merge_conn(
+        models.Connection(
+            conn_id='spark_default', conn_type='spark',
+            host='yarn', extra='{"queue": "root.default"}'))
+    merge_conn(
+        models.Connection(
+            conn_id='druid_ingest_default', conn_type='druid',
+            host='druid-overlord', port=8081, extra='{"endpoint": "druid/indexer/v1/task"}'))
+    merge_conn(
+        models.Connection(
+            conn_id='redis_default', conn_type='redis',
+            host='localhost', port=6379,
+            extra='{"db": 0}'))
+    merge_conn(
+        models.Connection(
+            conn_id='sqoop_default', conn_type='sqoop',
+            host='rmdbs', extra=''))
     merge_conn(
         models.Connection(
             conn_id='emr_default', conn_type='emr',
@@ -238,6 +243,14 @@ def initdb():
                     ]
                 }
             '''))
+    merge_conn(
+        models.Connection(
+            conn_id='databricks_default', conn_type='databricks',
+            host='localhost'))
+    merge_conn(
+        models.Connection(
+            conn_id='qubole_default', conn_type='qubole',
+            host= 'localhost'))
 
     # Known event types
     KET = models.KnownEventType
@@ -255,9 +268,8 @@ def initdb():
 
     dagbag = models.DagBag()
     # Save individual DAGs in the ORM
-    now = datetime.utcnow()
     for dag in dagbag.dags.values():
-        models.DAG.sync_to_db(dag, dag.owner, now)
+        dag.sync_to_db()
     # Deactivate the unknown ones
     models.DAG.deactivate_unknown_dags(dagbag.dags.keys())
 
@@ -281,14 +293,18 @@ def initdb():
 
 
 def upgradedb():
-    logging.info("Creating tables")
+    # alembic adds significant import time, so we import it lazily
+    from alembic import command
+    from alembic.config import Config
+
+    log.info("Creating tables")
+
     current_dir = os.path.dirname(os.path.abspath(__file__))
     package_dir = os.path.normpath(os.path.join(current_dir, '..'))
     directory = os.path.join(package_dir, 'migrations')
     config = Config(os.path.join(package_dir, 'alembic.ini'))
     config.set_main_option('script_location', directory)
-    config.set_main_option('sqlalchemy.url',
-                           configuration.get('core', 'SQL_ALCHEMY_CONN'))
+    config.set_main_option('sqlalchemy.url', settings.SQL_ALCHEMY_CONN)
     command.upgrade(config, 'heads')
 
 
@@ -297,8 +313,11 @@ def resetdb():
     Clear out the database
     '''
     from airflow import models
+    # alembic adds significant import time, so we import it lazily
+    from alembic.migration import MigrationContext
 
-    logging.info("Dropping tables that exist")
+    log.info("Dropping tables that exist")
+
     models.Base.metadata.drop_all(settings.engine)
     mc = MigrationContext.configure(settings.engine)
     if mc._version.exists(settings.engine):

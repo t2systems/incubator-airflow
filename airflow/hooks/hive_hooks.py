@@ -14,13 +14,11 @@
 #
 
 from __future__ import print_function
-from builtins import zip
+from six.moves import zip
 from past.builtins import basestring
 
-import collections
 import unicodecsv as csv
 import itertools
-import logging
 import re
 import subprocess
 import time
@@ -38,7 +36,6 @@ HIVE_QUEUE_PRIORITIES = ['VERY_HIGH', 'HIGH', 'NORMAL', 'LOW', 'VERY_LOW']
 
 
 class HiveCliHook(BaseHook):
-
     """Simple wrapper around the hive CLI.
 
     It also supports the ``beeline``
@@ -147,11 +144,9 @@ class HiveCliHook(BaseHook):
         if not d:
             return []
         return as_flattened_list(
-            itertools.izip(
-                ["-hiveconf"] * len(d),
-                ["{}={}".format(k, v) for k, v in d.items()]
-                )
-            )
+            zip(["-hiveconf"] * len(d),
+                ["{}={}".format(k, v) for k, v in d.items()])
+        )
 
     def run_cli(self, hql, schema=None, verbose=True, hive_conf=None):
         """
@@ -204,12 +199,13 @@ class HiveCliHook(BaseHook):
                 hive_cmd.extend(['-f', f.name])
 
                 if verbose:
-                    logging.info(" ".join(hive_cmd))
+                    self.log.info(" ".join(hive_cmd))
                 sp = subprocess.Popen(
                     hive_cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    cwd=tmp_dir)
+                    cwd=tmp_dir,
+                    close_fds=True)
                 self.sp = sp
                 stdout = ''
                 while True:
@@ -218,7 +214,7 @@ class HiveCliHook(BaseHook):
                         break
                     stdout += line.decode('UTF-8')
                     if verbose:
-                        logging.info(line.decode('UTF-8').strip())
+                        self.log.info(line.decode('UTF-8').strip())
                 sp.wait()
 
                 if sp.returncode:
@@ -249,7 +245,7 @@ class HiveCliHook(BaseHook):
             for query in query_set:
 
                 query_preview = ' '.join(query.split())[:50]
-                logging.info("Testing HQL [{0} (...)]".format(query_preview))
+                self.log.info("Testing HQL [%s (...)]", query_preview)
                 if query_set == insert:
                     query = other + '; explain ' + query
                 else:
@@ -258,16 +254,81 @@ class HiveCliHook(BaseHook):
                     self.run_cli(query, verbose=False)
                 except AirflowException as e:
                     message = e.args[0].split('\n')[-2]
-                    logging.info(message)
+                    self.log.info(message)
                     error_loc = re.search('(\d+):(\d+)', message)
                     if error_loc and error_loc.group(1).isdigit():
                         l = int(error_loc.group(1))
                         begin = max(l-2, 0)
                         end = min(l+3, len(query.split('\n')))
                         context = '\n'.join(query.split('\n')[begin:end])
-                        logging.info("Context :\n {0}".format(context))
+                        self.log.info("Context :\n %s", context)
                 else:
-                    logging.info("SUCCESS")
+                    self.log.info("SUCCESS")
+
+    def load_df(
+            self,
+            df,
+            table,
+            create=True,
+            recreate=False,
+            field_dict=None,
+            delimiter=',',
+            encoding='utf8',
+            pandas_kwargs=None, **kwargs):
+        """
+        Loads a pandas DataFrame into hive.
+
+        Hive data types will be inferred if not passed but column names will
+        not be sanitized.
+
+        :param table: target Hive table, use dot notation to target a
+            specific database
+        :type table: str
+        :param create: whether to create the table if it doesn't exist
+        :type create: bool
+        :param recreate: whether to drop and recreate the table at every
+            execution
+        :type recreate: bool
+        :param field_dict: mapping from column name to hive data type
+        :type field_dict: dict
+        :param encoding: string encoding to use when writing DataFrame to file
+        :type encoding: str
+        :param pandas_kwargs: passed to DataFrame.to_csv
+        :type pandas_kwargs: dict
+        :param kwargs: passed to self.load_file
+        """
+
+        def _infer_field_types_from_df(df):
+            DTYPE_KIND_HIVE_TYPE = {
+                'b': 'BOOLEAN',  # boolean
+                'i': 'BIGINT',   # signed integer
+                'u': 'BIGINT',   # unsigned integer
+                'f': 'DOUBLE',   # floating-point
+                'c': 'STRING',   # complex floating-point
+                'O': 'STRING',   # object
+                'S': 'STRING',   # (byte-)string
+                'U': 'STRING',   # Unicode
+                'V': 'STRING'    # void
+            }
+
+            return dict((col, DTYPE_KIND_HIVE_TYPE[dtype.kind]) for col, dtype in df.dtypes.iteritems())
+
+        if pandas_kwargs is None:
+            pandas_kwargs = {}
+
+        with TemporaryDirectory(prefix='airflow_hiveop_') as tmp_dir:
+            with NamedTemporaryFile(dir=tmp_dir) as f:
+
+                if field_dict is None and (create or recreate):
+                    field_dict = _infer_field_types_from_df(df)
+
+                df.to_csv(f, sep=delimiter, **pandas_kwargs)
+
+                return self.load_file(filepath=f.name,
+                                      table=table,
+                                      delimiter=delimiter,
+                                      field_dict=field_dict,
+                                      **kwargs)
 
     def load_file(
             self,
@@ -278,7 +339,8 @@ class HiveCliHook(BaseHook):
             create=True,
             overwrite=True,
             partition=None,
-            recreate=False):
+            recreate=False,
+            tblproperties=None):
         """
         Loads a local file into Hive
 
@@ -289,24 +351,35 @@ class HiveCliHook(BaseHook):
         stage the data into a temporary table before loading it into its
         final destination using a ``HiveOperator``.
 
+        :param filepath: local filepath of the file to load
+        :type filepath: str
         :param table: target Hive table, use dot notation to target a
             specific database
         :type table: str
+        :param delimiter: field delimiter in the file
+        :type delimiter: str
+        :param field_dict: A dictionary of the fields name in the file
+            as keys and their Hive types as values
+        :type field_dict: dict
         :param create: whether to create the table if it doesn't exist
         :type create: bool
-        :param recreate: whether to drop and recreate the table at every
-            execution
-        :type recreate: bool
+        :param overwrite: whether to overwrite the data in table or partition
+        :type overwrite: bool
         :param partition: target partition as a dict of partition columns
             and values
         :type partition: dict
-        :param delimiter: field delimiter in the file
-        :type delimiter: str
+        :param recreate: whether to drop and recreate the table at every
+            execution
+        :type recreate: bool
+        :param tblproperties: TBLPROPERTIES of the hive table being created
+        :type tblproperties: dict
         """
         hql = ''
         if recreate:
             hql += "DROP TABLE IF EXISTS {table};\n"
         if create or recreate:
+            if field_dict is None:
+                raise ValueError("Must provide a field dict when creating a table")
             fields = ",\n    ".join(
                 [k + ' ' + v for k, v in field_dict.items()])
             hql += "CREATE TABLE IF NOT EXISTS {table} (\n{fields})\n"
@@ -316,9 +389,14 @@ class HiveCliHook(BaseHook):
                 hql += "PARTITIONED BY ({pfields})\n"
             hql += "ROW FORMAT DELIMITED\n"
             hql += "FIELDS TERMINATED BY '{delimiter}'\n"
-            hql += "STORED AS textfile;"
+            hql += "STORED AS textfile\n"
+            if tblproperties is not None:
+                tprops = ", ".join(
+                    ["'{0}'='{1}'".format(k, v) for k, v in tblproperties.items()])
+                hql += "TBLPROPERTIES({tprops})\n"
+        hql += ";"
         hql = hql.format(**locals())
-        logging.info(hql)
+        self.log.info(hql)
         self.run_cli(hql)
         hql = "LOAD DATA LOCAL INPATH '{filepath}' "
         if overwrite:
@@ -329,7 +407,7 @@ class HiveCliHook(BaseHook):
                 ["{0}='{1}'".format(k, v) for k, v in partition.items()])
             hql += "PARTITION ({pvals});"
         hql = hql.format(**locals())
-        logging.info(hql)
+        self.log.info(hql)
         self.run_cli(hql)
 
     def kill(self):
@@ -573,7 +651,7 @@ class HiveServer2Hook(BaseHook):
     def __init__(self, hiveserver2_conn_id='hiveserver2_default'):
         self.hiveserver2_conn_id = hiveserver2_conn_id
 
-    def get_conn(self):
+    def get_conn(self, schema=None):
         db = self.get_connection(self.hiveserver2_conn_id)
         auth_mechanism = db.extra_dejson.get('authMechanism', 'PLAIN')
         kerberos_service_name = None
@@ -583,8 +661,10 @@ class HiveServer2Hook(BaseHook):
 
         # impyla uses GSSAPI instead of KERBEROS as a auth_mechanism identifier
         if auth_mechanism == 'KERBEROS':
-            logging.warning("Detected deprecated 'KERBEROS' for authMechanism for %s. Please use 'GSSAPI' instead",
-                            self.hiveserver2_conn_id)
+            self.log.warning(
+                "Detected deprecated 'KERBEROS' for authMechanism for %s. Please use 'GSSAPI' instead",
+                self.hiveserver2_conn_id
+            )
             auth_mechanism = 'GSSAPI'
 
         from impala.dbapi import connect
@@ -594,11 +674,11 @@ class HiveServer2Hook(BaseHook):
             auth_mechanism=auth_mechanism,
             kerberos_service_name=kerberos_service_name,
             user=db.login,
-            database=db.schema or 'default')
+            database=schema or db.schema or 'default')
 
     def get_results(self, hql, schema='default', arraysize=1000):
         from impala.error import ProgrammingError
-        with self.get_conn() as conn:
+        with self.get_conn(schema) as conn:
             if isinstance(hql, basestring):
                 hql = [hql]
             results = {
@@ -615,7 +695,7 @@ class HiveServer2Hook(BaseHook):
                     # may be `SET` or DDL
                     records = cur.fetchall()
                 except ProgrammingError:
-                    logging.debug("get_results returned no records")
+                    self.log.debug("get_results returned no records")
                 if records:
                     results = {
                         'data': records,
@@ -633,9 +713,9 @@ class HiveServer2Hook(BaseHook):
             output_header=True,
             fetch_size=1000):
         schema = schema or 'default'
-        with self.get_conn() as conn:
+        with self.get_conn(schema) as conn:
             with conn.cursor() as cur:
-                logging.info("Running query: " + hql)
+                self.log.info("Running query: %s", hql)
                 cur.execute(hql)
                 schema = cur.description
                 with open(csv_filepath, 'wb') as f:
@@ -653,8 +733,8 @@ class HiveServer2Hook(BaseHook):
 
                         writer.writerows(rows)
                         i += len(rows)
-                        logging.info("Written {0} rows so far.".format(i))
-                    logging.info("Done. Loaded a total of {0} rows.".format(i))
+                        self.log.info("Written %s rows so far.", i)
+                    self.log.info("Done. Loaded a total of %s rows.", i)
 
     def get_records(self, hql, schema='default'):
         """

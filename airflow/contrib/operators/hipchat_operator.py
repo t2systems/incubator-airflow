@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from builtins import str
+
 from airflow.utils.decorators import apply_defaults
 from airflow.models import BaseOperator
 from airflow.exceptions import AirflowException
-import logging
 import requests
 import json
 
@@ -50,7 +51,6 @@ class HipChatAPIOperator(BaseOperator):
         """
         Used by the execute function. Set the request method, url, and body of HipChat's
         REST API call.
-
         Override in child class. Each HipChatAPI child operator is responsible for having
         a prepare_request method call which sets self.method, self.url, and self.body.
         """
@@ -66,8 +66,8 @@ class HipChatAPIOperator(BaseOperator):
                                         'Authorization': 'Bearer %s' % self.token},
                                     data=self.body)
         if response.status_code >= 400:
-            logging.error('HipChat API call failed: %s %s',
-                          response.status_code, response.reason)
+            self.log.error('HipChat API call failed: %s %s',
+                           response.status_code, response.reason)
             raise AirflowException('HipChat API call failed: %s %s' %
                                    (response.status_code, response.reason))
 
@@ -110,7 +110,7 @@ class HipChatAPISendRoomNotificationOperator(HipChatAPIOperator):
             'notify': False,
             'card': None
         }
-        for (prop, default) in default_options.iteritems():
+        for (prop, default) in default_options.items():
             setattr(self, prop, kwargs.get(prop, default))
 
     def prepare_request(self):
@@ -127,4 +127,4 @@ class HipChatAPISendRoomNotificationOperator(HipChatAPIOperator):
         self.method = 'POST'
         self.url = '%s/room/%s/notification' % (self.base_url, self.room_id)
         self.body = json.dumps(dict(
-            (k.encode('utf-8'), v.encode('utf-8')) for k, v in params.iteritems() if v))
+            (str(k), str(v)) for k, v in params.items() if v))

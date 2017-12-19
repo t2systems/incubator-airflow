@@ -48,12 +48,14 @@ _hooks = {
     'samba_hook': ['SambaHook'],
     'sqlite_hook': ['SqliteHook'],
     'S3_hook': ['S3Hook'],
+    'zendesk_hook': ['ZendeskHook'],
     'http_hook': ['HttpHook'],
     'druid_hook': ['DruidHook'],
     'jdbc_hook': ['JdbcHook'],
     'dbapi_hook': ['DbApiHook'],
     'mssql_hook': ['MsSqlHook'],
     'oracle_hook': ['OracleHook'],
+    'slack_hook': ['SlackHook'],
 }
 
 import os as _os
@@ -64,21 +66,23 @@ if not _os.environ.get('AIRFLOW_USE_NEW_IMPORTS', False):
 
 def _integrate_plugins():
     """Integrate plugins to the context"""
-    from airflow.plugins_manager import hooks as _hooks
-    for _hook_module in _hooks:
-        sys.modules[_hook_module.__name__] = _hook_module
-        globals()[_hook_module._name] = _hook_module
+    from airflow.plugins_manager import hooks_modules
+    for hooks_module in hooks_modules:
+        sys.modules[hooks_module.__name__] = hooks_module
+        globals()[hooks_module._name] = hooks_module
 
         ##########################################################
         # TODO FIXME Remove in Airflow 2.0
 
         if not _os.environ.get('AIRFLOW_USE_NEW_IMPORTS', False):
             from zope.deprecation import deprecated as _deprecated
-            for _hook in _hook_module._objects:
-                globals()[_hook.__name__] = _deprecated(
-                    _hook,
+            for _hook in hooks_module._objects:
+                hook_name = _hook.__name__
+                globals()[hook_name] = _hook
+                _deprecated(
+                    hook_name,
                     "Importing plugin hook '{i}' directly from "
                     "'airflow.hooks' has been deprecated. Please "
                     "import from 'airflow.hooks.[plugin_module]' "
                     "instead. Support for direct imports will be dropped "
-                    "entirely in Airflow 2.0.".format(i=_hook))
+                    "entirely in Airflow 2.0.".format(i=hook_name))

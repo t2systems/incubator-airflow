@@ -14,20 +14,15 @@
 
 from __future__ import print_function
 
-import datetime
-import os
-import unittest
-import six
-
-from airflow import DAG, configuration, operators, utils
+from airflow import DAG, configuration, operators
 from airflow.utils.tests import skipUnlessImported
+from airflow.utils import timezone
+
 configuration.load_test_config()
 
-import os
 import unittest
 
-
-DEFAULT_DATE = datetime.datetime(2015, 1, 1)
+DEFAULT_DATE = timezone.datetime(2015, 1, 1)
 DEFAULT_DATE_ISO = DEFAULT_DATE.isoformat()
 DEFAULT_DATE_DS = DEFAULT_DATE_ISO[:10]
 TEST_DAG_ID = 'unit_test_dag'
@@ -71,6 +66,28 @@ class MySqlTest(unittest.TestCase):
             sql=sql, dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, ignore_ti_state=True)
 
+    def mysql_hook_test_bulk_load(self):
+        records = ("foo", "bar", "baz")
+
+        import tempfile
+        with tempfile.NamedTemporaryFile() as t:
+            t.write("\n".join(records).encode('utf8'))
+            t.flush()
+
+            from airflow.hooks.mysql_hook import MySqlHook
+            h = MySqlHook('airflow_ci')
+            with h.get_conn() as c:
+                c.execute("""
+                    CREATE TABLE IF NOT EXISTS test_airflow (
+                        dummy VARCHAR(50)
+                    )
+                """)
+                c.execute("TRUNCATE TABLE test_airflow")
+                h.bulk_load("test_airflow", t.name)
+                c.execute("SELECT dummy FROM test_airflow")
+                results = tuple(result[0] for result in c.fetchall())
+                self.assertEqual(sorted(results), sorted(records))
+
     def test_mysql_to_mysql(self):
         sql = "SELECT * FROM INFORMATION_SCHEMA.TABLES LIMIT 100;"
         import airflow.operators.generic_transfer
@@ -95,6 +112,28 @@ class MySqlTest(unittest.TestCase):
             sql="SELECT count(1) FROM INFORMATION_SCHEMA.TABLES",
             dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, ignore_ti_state=True)
+
+    def test_overwrite_schema(self):
+        """
+        Verifies option to overwrite connection schema
+        """
+        import airflow.operators.mysql_operator
+
+        sql = "SELECT 1;"
+        t = operators.mysql_operator.MySqlOperator(
+            task_id='test_mysql_operator_test_schema_overwrite',
+            sql=sql,
+            dag=self.dag,
+            database="foobar",
+        )
+
+        from _mysql_exceptions import OperationalError
+        try:
+            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE,
+                  ignore_ti_state=True)
+        except OperationalError as e:
+            assert "Unknown database 'foobar'" in str(e)
+
 
 @skipUnlessImported('airflow.operators.postgres_operator', 'PostgresOperator')
 class PostgresTest(unittest.TestCase):
@@ -160,6 +199,43 @@ class PostgresTest(unittest.TestCase):
             dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, ignore_ti_state=True)
 
+    def test_vacuum(self):
+        """
+        Verifies the VACUUM operation runs well with the PostgresOperator
+        """
+        import airflow.operators.postgres_operator
+
+        sql = "VACUUM ANALYZE;"
+        t = operators.postgres_operator.PostgresOperator(
+            task_id='postgres_operator_test_vacuum',
+            sql=sql,
+            dag=self.dag,
+            autocommit=True)
+        t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, ignore_ti_state=True)
+
+    def test_overwrite_schema(self):
+        """
+        Verifies option to overwrite connection schema
+        """
+        import airflow.operators.postgres_operator
+
+        sql = "SELECT 1;"
+        t = operators.postgres_operator.PostgresOperator(
+            task_id='postgres_operator_test_schema_overwrite',
+            sql=sql,
+            dag=self.dag,
+            autocommit=True,
+            database="foobar",
+        )
+
+        from psycopg2._psycopg import OperationalError
+        try:
+            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE,
+                  ignore_ti_state=True)
+        except OperationalError as e:
+            assert 'database "foobar" does not exist' in str(e)
+
+
 @skipUnlessImported('airflow.operators.hive_operator', 'HiveOperator')
 @skipUnlessImported('airflow.operators.postgres_operator', 'PostgresOperator')
 class TransferTests(unittest.TestCase):
@@ -174,7 +250,7 @@ class TransferTests(unittest.TestCase):
     def test_clear(self):
         self.dag.clear(
             start_date=DEFAULT_DATE,
-            end_date=datetime.datetime.now())
+            end_date=timezone.utcnow())
 
     def test_mysql_to_hive(self):
         # import airflow.operators
@@ -204,5 +280,21 @@ class TransferTests(unittest.TestCase):
             recreate=False,
             create=True,
             delimiter=",",
+            dag=self.dag)
+        t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, ignore_ti_state=True)
+
+    def test_mysql_to_hive_tblproperties(self):
+        # import airflow.operators
+        from airflow.operators.mysql_to_hive import MySqlToHiveTransfer
+        sql = "SELECT * FROM baby_names LIMIT 1000;"
+        t = MySqlToHiveTransfer(
+            task_id='test_m2h',
+            mysql_conn_id='airflow_ci',
+            hive_cli_conn_id='beeline_default',
+            sql=sql,
+            hive_table='test_mysql_to_hive',
+            recreate=True,
+            delimiter=",",
+            tblproperties={'test_property':'test_value'},
             dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, ignore_ti_state=True)
